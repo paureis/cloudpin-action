@@ -1,0 +1,227 @@
+name: Test
+
+# Runs the action from this checkout (uses: ./) against a real CLI with no cloud
+# account: Kubernetes, whose kubeconfig cloudpin reads without network access.
+# cloudpin is built from paureis/cloudpin main until the release it needs is on npm.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner to test on (run windows-latest once before a release)
+        type: choice
+        options: [ubuntu-latest, windows-latest]
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    env:
+      KUBECONFIG: ${{ github.workspace }}/test/fixtures/kubeconfig
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out cloudpin main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: paureis/cloudpin
+          ref: main
+          path: cloudpin-src
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Build a cloudpin tarball
+        working-directory: cloudpin-src
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run build
+          file="$(npm pack --silent | tail -n 1)"
+          test -f "$file"
+          # GITHUB_WORKSPACE is a native path on every runner, which npm accepts.
+          echo "CLOUDPIN_TGZ=$GITHUB_WORKSPACE/cloudpin-src/$file" >> "$GITHUB_ENV"
+
+      - name: Unit tests
+        run: |
+          # Node 22's --test takes files or globs, not a folder; a glob that
+          # matches nothing would pass with 0 tests, so require at least one file.
+          shopt -s nullglob
+          files=(test/*.test.mjs)
+          if [ "${#files[@]}" -eq 0 ]; then echo "::error::no test files found"; exit 1; fi
+          node --test "${files[@]}"
+
+      - name: Set up one folder per case
+        run: |
+          cases="$RUNNER_TEMP/cases"
+          rm -rf "$cases"
+          for name in right-pin wrong-pin no-pin-file not-pinned two-clouds every-pinned environment-input head-branch; do
+            mkdir -p "$cases/$name"
+          done
+          printf 'kubernetes:\n  server: https://a.example.invalid\n' > "$cases/right-pin/.cloudpin.yml"
+          printf 'kubernetes:\n  server: https://b.example.invalid\n' > "$cases/wrong-pin/.cloudpin.yml"
+          printf 'kubernetes:\n  server: https://a.example.invalid\n' > "$cases/not-pinned/.cloudpin.yml"
+          printf 'kubernetes:\n  server: https://a.example.invalid\ngithub:\n  user: someone-else\n' > "$cases/two-clouds/.cloudpin.yml"
+          printf 'kubernetes:\n  server: https://a.example.invalid\n' > "$cases/every-pinned/.cloudpin.yml"
+          # The branches rule picks "wrong" for every branch: only the environment input can pick "right".
+          printf 'environments:\n  wrong:\n    kubernetes: { server: https://b.example.invalid }\n  right:\n    kubernetes: { server: https://a.example.invalid }\nbranches:\n  "*": wrong\n' > "$cases/environment-input/.cloudpin.yml"
+          # Not a git repository, so without CLOUDPIN_BRANCH cloudpin falls back to the first ("wrong").
+          branch="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          printf 'environments:\n  wrong:\n    kubernetes: { server: https://b.example.invalid }\n  right:\n    kubernetes: { server: https://a.example.invalid }\nbranches:\n  "%s": right\n' "$branch" > "$cases/head-branch/.cloudpin.yml"
+
+          # cloudpin searches upward: no .cloudpin.yml may sit above the cases,
+          # and the no-pin-file case must be empty, or the cases prove nothing.
+          if [ -n "$(ls -A "$cases/no-pin-file")" ]; then echo "::error::no-pin-file is not empty"; exit 1; fi
+          dir="$(cd "$cases" && pwd)"
+          while :; do
+            if [ -e "$dir/.cloudpin.yml" ]; then echo "::error::$dir/.cloudpin.yml exists above the cases"; exit 1; fi
+            parent="$(dirname "$dir")"
+            [ "$parent" = "$dir" ] && break
+            dir="$parent"
+          done
+          echo "checked every folder above $cases: no .cloudpin.yml"
+
+      # 1. The right pin passes.
+      - name: "Case: right pin"
+        id: right-pin
+        uses: ./
+        with:
+          package: ${{ env.CLOUDPIN_TGZ }}
+          check: kubernetes
+          working-directory: ${{ runner.temp }}/cases/right-pin
+      - name: "Assert: right pin passed with result match"
+        env:
+          OUTCOME: ${{ steps.right-pin.outcome }}
+          RESULT: ${{ steps.right-pin.outputs.result }}
+        run: |
+          echo "outcome=$OUTCOME result=$RESULT"
+          if [ "$OUTCOME" != success ] || [ "$RESULT" != match ]; then echo "::error::expected success and match"; exit 1; fi
+
+      # 2. The control: a wrong pin must fail. If this ever passes, the test proves nothing.
+      - name: "Case: wrong pin (control, must fail)"
+        id: wrong-pin
+        continue-on-error: true
+        uses: ./
+        with:
+          package: ${{ env.CLOUDPIN_TGZ }}
+          check: kubernetes
+          working-directory: ${{ runner.temp }}/cases/wrong-pin
+      - name: "Assert: wrong pin failed with result mismatch"
+        env:
+          OUTCOME: ${{ steps.wrong-pin.outcome }}
+          RESULT: ${{ steps.wrong-pin.outputs.result }}
+        run: |
+          echo "outcome=$OUTCOME result=$RESULT"
+          if [ "$OUTCOME" != failure ] || [ "$RESULT" != mismatch ]; then echo "::error::the control did not fail as a mismatch"; exit 1; fi
+
+      # 3. No .cloudpin.yml and no check input: nothing is pinned, so it passes.
+      - name: "Case: no .cloudpin.yml"
+        id: no-pin-file
+        uses: ./
+        with:
+          package: ${{ env.CLOUDPIN_TGZ }}
+          working-directory: ${{ runner.temp }}/cases/no-pin-file
+      - name: "Assert: no .cloudpin.yml passed with result unpinned"
+        env:
+          OUTCOME: ${{ steps.no-pin-file.outcome }}
+          RESULT: ${{ steps.no-pin-file.outputs.result }}
+        run: |
+          echo "outcome=$OUTCOME result=$RESULT"
+          if [ "$OUTCOME" != success ] || [ "$RESULT" != unpinned ]; then echo "::error::expected success and unpinned"; exit 1; fi
+
+      # 4. A checked cloud that is not pinned is an error, not a pass.
+      - name: "Case: check a cloud that is not pinned (must fail)"
+        id: not-pinned
+        continue-on-error: true
+        uses: ./
+        with:
+          package: ${{ env.CLOUDPIN_TGZ }}
+          check: aws
+          working-directory: ${{ runner.temp }}/cases/not-pinned
+      - name: "Assert: not-pinned failed with result error"
+        env:
+          OUTCOME: ${{ steps.not-pinned.outcome }}
+          RESULT: ${{ steps.not-pinned.outputs.result }}
+        run: |
+          echo "outcome=$OUTCOME result=$RESULT"
+          if [ "$OUTCOME" != failure ] || [ "$RESULT" != error ]; then echo "::error::expected failure and error"; exit 1; fi
+
+      # 5. Pinned clouds that are not checked are ignored (gh is not logged in here).
+      - name: "Case: two clouds pinned, one checked"
+        id: two-clouds
+        uses: ./
+        with:
+          package: ${{ env.CLOUDPIN_TGZ }}
+          check: kubernetes
+          working-directory: ${{ runner.temp }}/cases/two-clouds
+      - name: "Assert: two clouds passed with result match"
+        env:
+          OUTCOME: ${{ steps.two-clouds.outcome }}
+          RESULT: ${{ steps.two-clouds.outputs.result }}
+        run: |
+          echo "outcome=$OUTCOME result=$RESULT"
+          if [ "$OUTCOME" != success ] || [ "$RESULT" != match ]; then echo "::error::expected success and match"; exit 1; fi
+
+      # 6. No check input: every pinned cloud, strictly (the two-pass path).
+      - name: "Case: every pinned cloud"
+        id: every-pinned
+        uses: ./
+        with:
+          package: ${{ env.CLOUDPIN_TGZ }}
+          working-directory: ${{ runner.temp }}/cases/every-pinned
+      - name: "Assert: every pinned cloud passed with result match"
+        env:
+          OUTCOME: ${{ steps.every-pinned.outcome }}
+          RESULT: ${{ steps.every-pinned.outputs.result }}
+        run: |
+          echo "outcome=$OUTCOME result=$RESULT"
+          if [ "$OUTCOME" != success ] || [ "$RESULT" != match ]; then echo "::error::expected success and match"; exit 1; fi
+
+      # 7. The environment input (CLOUDPIN_ENV) wins over the branches mapping.
+      - name: "Case: environment input"
+        id: environment-input
+        uses: ./
+        with:
+          package: ${{ env.CLOUDPIN_TGZ }}
+          check: kubernetes
+          environment: right
+          working-directory: ${{ runner.temp }}/cases/environment-input
+      - name: "Assert: environment input passed with result match"
+        env:
+          OUTCOME: ${{ steps.environment-input.outcome }}
+          RESULT: ${{ steps.environment-input.outputs.result }}
+        run: |
+          echo "outcome=$OUTCOME result=$RESULT"
+          if [ "$OUTCOME" != success ] || [ "$RESULT" != match ]; then echo "::error::expected success and match"; exit 1; fi
+
+      # 8. CLOUDPIN_BRANCH: the head branch (pull_request) or ref name picks the environment.
+      - name: "Case: branch mapping"
+        id: head-branch
+        uses: ./
+        with:
+          package: ${{ env.CLOUDPIN_TGZ }}
+          check: kubernetes
+          working-directory: ${{ runner.temp }}/cases/head-branch
+      - name: "Assert: branch mapping passed with result match"
+        env:
+          OUTCOME: ${{ steps.head-branch.outcome }}
+          RESULT: ${{ steps.head-branch.outputs.result }}
+        run: |
+          echo "outcome=$OUTCOME result=$RESULT"
+          if [ "$OUTCOME" != success ] || [ "$RESULT" != match ]; then echo "::error::expected success and match"; exit 1; fi

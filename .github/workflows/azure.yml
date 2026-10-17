@@ -1,0 +1,121 @@
+name: azure
+
+# The real-login test: the action against a real Azure login (GitHub OIDC),
+# not a fake kubeconfig. It proves that the right pin passes and that a wrong
+# pin fails as a mismatch (the control). The owner runs it by hand from main
+# before a release. It needs the repository secrets AZURE_CLIENT_ID,
+# AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID and a federated credential that
+# trusts refs/heads/main. Read-only: it logs in and runs cloudpin check, nothing else.
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: azure-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  azure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The federated credential trusts only refs/heads/main.
+    if: github.ref == 'refs/heads/main'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out cloudpin main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: paureis/cloudpin
+          ref: main
+          path: cloudpin-src
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      # Until cloudpin 1.2.0 is on npm; then drop this step and the package
+      # inputs below, and use the action's default version.
+      - name: Build a cloudpin tarball
+        working-directory: cloudpin-src
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run build
+          file="$(npm pack --silent | tail -n 1)"
+          test -f "$file"
+          # GITHUB_WORKSPACE is a native path on every runner, which npm accepts.
+          echo "CLOUDPIN_TGZ=$GITHUB_WORKSPACE/cloudpin-src/$file" >> "$GITHUB_ENV"
+
+      # Secrets, not variables: the repository is public, and GitHub masks
+      # secrets in logs and the job summary.
+      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up the two case folders
+        env:
+          PIN_SUBSCRIPTION: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          PIN_TENANT: ${{ secrets.AZURE_TENANT_ID }}
+        run: |
+          cases="$RUNNER_TEMP/azure"
+          rm -rf "$cases"
+          mkdir -p "$cases/right" "$cases/wrong"
+          if [ -z "$PIN_SUBSCRIPTION" ] || [ -z "$PIN_TENANT" ]; then
+            echo "::error::the AZURE_SUBSCRIPTION_ID and AZURE_TENANT_ID secrets are required"
+            exit 1
+          fi
+          printf 'azure:\n  subscription: "%s"\n  tenant: "%s"\n' "$PIN_SUBSCRIPTION" "$PIN_TENANT" > "$cases/right/.cloudpin.yml"
+          printf 'azure:\n  subscription: "00000000-0000-0000-0000-000000000000"\n' > "$cases/wrong/.cloudpin.yml"
+
+          # cloudpin searches upward: no .cloudpin.yml may sit above the cases.
+          dir="$(cd "$cases" && pwd)"
+          while :; do
+            if [ -e "$dir/.cloudpin.yml" ]; then echo "::error::$dir/.cloudpin.yml exists above the cases"; exit 1; fi
+            parent="$(dirname "$dir")"
+            [ "$parent" = "$dir" ] && break
+            dir="$parent"
+          done
+          echo "checked every folder above $cases: no .cloudpin.yml"
+
+      - name: right pin
+        id: right
+        uses: ./
+        with:
+          package: ${{ env.CLOUDPIN_TGZ }}
+          check: azure
+          working-directory: ${{ runner.temp }}/azure/right
+      - name: assert the right pin matched
+        env:
+          OUTCOME: ${{ steps.right.outcome }}
+          RESULT: ${{ steps.right.outputs.result }}
+        run: |
+          echo "outcome=$OUTCOME result=$RESULT"
+          if [ "$OUTCOME" != success ] || [ "$RESULT" != match ]; then echo "::error::expected success and match"; exit 1; fi
+
+      # The control: a wrong pin must fail. If this ever passes, the test proves nothing.
+      - name: wrong pin
+        id: wrong
+        continue-on-error: true
+        uses: ./
+        with:
+          package: ${{ env.CLOUDPIN_TGZ }}
+          check: azure
+          working-directory: ${{ runner.temp }}/azure/wrong
+      - name: assert the control failed
+        env:
+          OUTCOME: ${{ steps.wrong.outcome }}
+          RESULT: ${{ steps.wrong.outputs.result }}
+        run: |
+          echo "outcome=$OUTCOME result=$RESULT"
+          if [ "$OUTCOME" != failure ] || [ "$RESULT" != mismatch ]; then echo "::error::the control did not fail as a mismatch"; exit 1; fi
