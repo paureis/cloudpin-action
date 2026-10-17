@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { summarize } from "../src/report.mjs";
+import { pinnedProviders, summarize } from "../src/report.mjs";
 
 // Reports printed by `cloudpin check --json --only kubernetes` (cloudpin main,
 // 4182a1b) against a kubeconfig whose context points at https://a.example.invalid.
@@ -172,7 +172,7 @@ test("the environment cloudpin chose is shown", () => {
 // The CLI entry: reads the report file, appends to the env files, exits.
 const SCRIPT = fileURLToPath(new URL("../src/report.mjs", import.meta.url));
 
-function cli(reportText, { withEnvFiles = true } = {}) {
+function cli(reportText, { withEnvFiles = true, args = [] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "cloudpin-action-test-"));
   try {
     const reportFile = join(dir, "report.json");
@@ -185,7 +185,7 @@ function cli(reportText, { withEnvFiles = true } = {}) {
     delete env.GITHUB_STEP_SUMMARY;
     delete env.GITHUB_OUTPUT;
     if (withEnvFiles) Object.assign(env, { GITHUB_STEP_SUMMARY: summaryFile, GITHUB_OUTPUT: outputFile });
-    const res = spawnSync(process.execPath, [SCRIPT, reportFile], { env, encoding: "utf8" });
+    const res = spawnSync(process.execPath, [SCRIPT, reportFile, ...args], { env, encoding: "utf8" });
     return {
       status: res.status,
       stdout: res.stdout,
@@ -231,4 +231,82 @@ test("cli: no argument exits 1", () => {
   delete env.GITHUB_OUTPUT;
   const res = spawnSync(process.execPath, [SCRIPT], { env, encoding: "utf8" });
   assert.equal(res.status, 1);
+});
+
+test("cli: cloudpin's exit code 0 with a match passes", () => {
+  const out = cli(JSON.stringify(MATCH), { args: ["0"] });
+  assert.equal(out.status, 0);
+  assert.equal(out.output, "other=1\nresult=match\n");
+});
+
+test("cli: a passing report from a cloudpin that exited non-zero fails closed", () => {
+  const out = cli(JSON.stringify(MATCH), { args: ["1"] });
+  assert.equal(out.status, 1);
+  assert.equal(out.output, "other=1\nresult=error\n");
+  assert.match(out.stdout, /exited with code 1/);
+});
+
+test("cli: a cloudpin exit code that is not a number fails closed", () => {
+  const out = cli(JSON.stringify(UNPINNED), { args: ["x"] });
+  assert.equal(out.status, 1);
+  assert.equal(out.output, "other=1\nresult=error\n");
+});
+
+test("summarize: a failing report keeps its result whatever cloudpin's exit code", () => {
+  assert.equal(summarize(JSON.stringify(MISMATCH), { cloudpinExit: 0 }).result, "mismatch");
+  assert.equal(summarize(JSON.stringify(MISMATCH), { cloudpinExit: 0 }).exitCode, 1);
+});
+
+// The first pass of the action's default mode: which providers are pinned.
+for (const [name, report, expected] of [
+  ["a plain report's providers, in order", {
+    result: "mismatch",
+    path: PATH,
+    environment: null,
+    providers: [
+      { provider: "aws", status: "not-installed", problems: ["aws is not installed here"] },
+      { provider: "kubernetes", status: "mismatch", problems: ["x"] },
+    ],
+  }, "aws,kubernetes"],
+  ["nothing for unpinned", UNPINNED, ""],
+  ["nothing for an error (that report is kept)", ERROR, ""],
+  ["nothing for an unreadable report", "not json", ""],
+  ["nothing for an unknown result", { result: "weird", providers: [] }, ""],
+]) {
+  test(`pinnedProviders: ${name}`, () => {
+    assert.equal(pinnedProviders(typeof report === "string" ? report : JSON.stringify(report)), expected);
+  });
+}
+
+test("pinnedProviders: a name that is not a plain provider name throws (never a lax pass)", () => {
+  const report = {
+    result: "match",
+    path: PATH,
+    environment: null,
+    providers: [{ provider: "kubernetes,aws", status: "match", problems: [] }],
+  };
+  assert.throws(() => pinnedProviders(JSON.stringify(report)), /provider name/);
+});
+
+test("cli --pinned prints the names and writes no output or summary", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cloudpin-action-test-"));
+  try {
+    const file = join(dir, "first.json");
+    writeFileSync(file, JSON.stringify(MISMATCH));
+    const env = { ...process.env, GITHUB_OUTPUT: join(dir, "out"), GITHUB_STEP_SUMMARY: join(dir, "sum") };
+    const res = spawnSync(process.execPath, [SCRIPT, "--pinned", file], { env, encoding: "utf8" });
+    assert.equal(res.status, 0);
+    assert.equal(res.stdout, "kubernetes\n");
+    assert.throws(() => readFileSync(join(dir, "out")));
+    const missing = spawnSync(process.execPath, [SCRIPT, "--pinned", join(dir, "nope.json")], { env, encoding: "utf8" });
+    assert.equal(missing.status, 0);
+    assert.equal(missing.stdout, "\n");
+    const bad = join(dir, "bad.json");
+    writeFileSync(bad, JSON.stringify({ ...MATCH, providers: [{ provider: "a b", status: "match", problems: [] }] }));
+    const refused = spawnSync(process.execPath, [SCRIPT, "--pinned", bad], { env, encoding: "utf8" });
+    assert.equal(refused.status, 1);
+    assert.match(refused.stdout, /^::error title=cloudpin::/m);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

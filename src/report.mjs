@@ -81,12 +81,35 @@ function parse(jsonText) {
 }
 
 /**
+ * The providers a plain `cloudpin check --json` found pinned, joined with
+ * commas for the strict second pass (`--only`). Empty means "keep this
+ * report": nothing pinned, an error, or a report that can't be read (which
+ * summarize then fails). A name that isn't a plain provider name throws, so
+ * the action stops rather than falling back to the lax first report.
+ * @param {string} jsonText
+ * @returns {string}
+ */
+export function pinnedProviders(jsonText) {
+  const report = parse(jsonText);
+  if (typeof report === "string" || (report.result !== "match" && report.result !== "mismatch")) return "";
+  const names = report.providers.map((entry) => entry.provider);
+  const bad = names.find((name) => !/^[a-z][a-z0-9-]*$/.test(name));
+  if (bad !== undefined) throw new Error(`unexpected provider name ${JSON.stringify(bad)} in cloudpin's result`);
+  return names.join(",");
+}
+
+/**
  * @param {string} jsonText what `cloudpin check --json` printed on stdout
+ * @param {{ cloudpinExit?: number }} [opts] cloudpin's own exit code, when known
  * @returns {{ result: "match"|"mismatch"|"unpinned"|"error", exitCode: 0|1, summary: string, annotations: string[], log: string[] }}
  */
-export function summarize(jsonText) {
+export function summarize(jsonText, opts = {}) {
   const report = parse(jsonText);
   if (typeof report === "string") return unreadable(report);
+  const passing = report.result === "match" || report.result === "unpinned";
+  if (passing && opts.cloudpinExit !== undefined && opts.cloudpinExit !== 0) {
+    return unreadable(`it says "${report.result}", but cloudpin exited with code ${opts.cloudpinExit}`);
+  }
 
   const strict = report.only !== undefined;
   const lines = [`### cloudpin: ${HEADINGS[report.result]}`, ""];
@@ -121,8 +144,7 @@ export function summarize(jsonText) {
   }
   if (report.error !== undefined) annotations.push(`::error title=cloudpin::${escapeData(report.error)}`);
 
-  const pass = report.result === "match" || report.result === "unpinned";
-  return { result: report.result, exitCode: pass ? 0 : 1, summary: lines.join("\n"), annotations, log };
+  return { result: report.result, exitCode: passing ? 0 : 1, summary: lines.join("\n"), annotations, log };
 }
 
 /** The outcome when there is no trustworthy report: always a failure. */
@@ -137,20 +159,38 @@ function unreadable(reason) {
   };
 }
 
-/** `node report.mjs <json-file>`: the action's last step. */
+const readOrUndefined = (file) => {
+  try {
+    return readFileSync(file, "utf8");
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * `node report.mjs <json-file> [cloudpin-exit-code]`: the action's last step.
+ * `node report.mjs --pinned <json-file>`: prints pinnedProviders for the first pass.
+ */
 function main(argv, env) {
-  const file = argv[0];
+  if (argv[0] === "--pinned") {
+    try {
+      console.log(pinnedProviders(readOrUndefined(argv[1] ?? "") ?? ""));
+      return 0;
+    } catch (err) {
+      console.log(`::error title=cloudpin::${escapeData(err.message)}`);
+      return 1;
+    }
+  }
+  const [file, exitArg] = argv;
   let outcome;
   if (file === undefined) {
     outcome = unreadable("no report file was given");
+  } else if (exitArg !== undefined && !/^[0-9]+$/.test(exitArg)) {
+    outcome = unreadable(`cloudpin's exit code ${JSON.stringify(exitArg)} is not a number`);
   } else {
-    let text;
-    try {
-      text = readFileSync(file, "utf8");
-    } catch {
-      text = undefined;
-    }
-    outcome = text === undefined ? unreadable("the report file is missing") : summarize(text);
+    const text = readOrUndefined(file);
+    const opts = exitArg === undefined ? {} : { cloudpinExit: Number(exitArg) };
+    outcome = text === undefined ? unreadable("the report file is missing") : summarize(text, opts);
   }
   for (const line of outcome.log) console.log(line);
   for (const line of outcome.annotations) console.log(line);

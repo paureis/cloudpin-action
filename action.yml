@@ -1,0 +1,137 @@
+name: cloudpin account check
+description: Fail the job when its cloud logins are not the accounts pinned in .cloudpin.yml, before anything deploys.
+author: paureis
+branding:
+  icon: lock
+  color: blue
+
+inputs:
+  check:
+    description: >-
+      Comma-separated clouds that must be installed, logged in and on the pinned account (for example
+      "azure, aws"). Empty means every cloud pinned in .cloudpin.yml, with the same strict rule.
+    required: false
+    default: ""
+  version:
+    description: The cloudpin version to install from npm (an exact version such as 1.2.0, or latest).
+    required: false
+    default: "1.2.0"
+  working-directory:
+    description: Where to look for .cloudpin.yml; cloudpin searches upward from there.
+    required: false
+    default: "."
+  environment:
+    description: The .cloudpin.yml environment to check (sets CLOUDPIN_ENV). Empty lets cloudpin pick it.
+    required: false
+    default: ""
+  package:
+    description: Internal, for this action's own tests. An npm install spec used instead of cloudpin@version.
+    required: false
+    default: ""
+
+outputs:
+  result:
+    description: match, mismatch, unpinned or error (empty when the step failed before checking).
+    value: ${{ steps.check.outputs.result }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check for Node.js 22 or later
+      shell: bash
+      run: |
+        set -euo pipefail
+        need="::error::cloudpin-action needs Node.js 22 or later; add actions/setup-node first"
+        if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+          echo "$need"
+          exit 1
+        fi
+        version="$(node --version)"
+        major="${version#v}"
+        major="${major%%.*}"
+        if ! [[ "$major" =~ ^[0-9]+$ ]] || (( major < 22 )); then
+          echo "$need (found ${version})"
+          exit 1
+        fi
+
+    - name: Install cloudpin
+      shell: bash
+      env:
+        CLOUDPIN_VERSION: ${{ inputs.version }}
+        CLOUDPIN_PACKAGE: ${{ inputs.package }}
+      run: |
+        set -euo pipefail
+        DIR="$RUNNER_TEMP/cloudpin"
+        if [ -n "$CLOUDPIN_PACKAGE" ]; then
+          SPEC="$CLOUDPIN_PACKAGE"
+        else
+          # An exact version or "latest": never a range, a tag that moves or a git URL.
+          if ! [[ "$CLOUDPIN_VERSION" =~ ^(latest|[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?)$ ]]; then
+            echo "::error::cloudpin-action: the version input must be an exact version such as 1.2.0, or latest"
+            exit 1
+          fi
+          SPEC="cloudpin@$CLOUDPIN_VERSION"
+        fi
+        rm -rf "$DIR"
+        mkdir -p "$DIR"
+        # --ignore-scripts: no install script of cloudpin or its dependencies ever runs.
+        npm install --prefix "$DIR" --ignore-scripts --no-audit --no-fund "$SPEC"
+        if [ ! -f "$DIR/node_modules/cloudpin/dist/cli.js" ]; then
+          echo "::error::cloudpin-action: npm install did not produce cloudpin's dist/cli.js"
+          exit 1
+        fi
+
+    - name: Verify npm signatures
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Verifies the registry signatures (and provenance attestations, where
+        # published) of every registry package installed under the prefix; it
+        # exits non-zero when one fails, and when nothing is there to audit.
+        # A local tarball (the package input) is not a registry package and is
+        # skipped; its registry dependencies are still checked.
+        npm audit signatures --prefix "$RUNNER_TEMP/cloudpin"
+
+    - name: Check the cloud accounts
+      id: check
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        CLOUDPIN_CHECK: ${{ inputs.check }}
+        CLOUDPIN_INPUT_ENVIRONMENT: ${{ inputs.environment }}
+      run: |
+        set -euo pipefail
+        CLI="$RUNNER_TEMP/cloudpin/node_modules/cloudpin/dist/cli.js"
+        REPORT_JS="$GITHUB_ACTION_PATH/src/report.mjs"
+        FIRST="$RUNNER_TEMP/cloudpin-pinned.json"
+        REPORT="$RUNNER_TEMP/cloudpin-report.json"
+        rm -f "$FIRST" "$REPORT"
+
+        # A pull_request run checks out a detached merge commit: name the head
+        # branch so cloudpin's branches: mapping still applies. The environment
+        # input (CLOUDPIN_ENV) wins over it inside cloudpin.
+        branch="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-}}"
+        if [ -n "$branch" ]; then export CLOUDPIN_BRANCH="$branch"; fi
+        if [ -n "$CLOUDPIN_INPUT_ENVIRONMENT" ]; then export CLOUDPIN_ENV="$CLOUDPIN_INPUT_ENVIRONMENT"; fi
+
+        rc=0
+        if [ -n "$CLOUDPIN_CHECK" ]; then
+          # Passed as is; cloudpin trims and lowercases the names.
+          node "$CLI" check --json "--only=$CLOUDPIN_CHECK" > "$REPORT" || rc=$?
+        else
+          # Every pinned cloud, strictly: learn which are pinned, then --only them.
+          node "$CLI" check --json > "$FIRST" || rc=$?
+          if ! names="$(node "$REPORT_JS" --pinned "$FIRST")"; then
+            echo "$names"
+            exit 1
+          fi
+          if [ -n "$names" ]; then
+            rc=0
+            node "$CLI" check --json "--only=$names" > "$REPORT" || rc=$?
+          else
+            # Nothing pinned, an error, or unreadable: report.mjs decides, failing closed.
+            cp "$FIRST" "$REPORT"
+          fi
+        fi
+
+        node "$REPORT_JS" "$REPORT" "$rc"
