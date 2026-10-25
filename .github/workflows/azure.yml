@@ -31,29 +31,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Check out cloudpin main
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: paureis/cloudpin
-          ref: main
-          path: cloudpin-src
-          persist-credentials: false
-
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
-
-      # Until cloudpin 1.2.0 is on npm; then drop this step and the package
-      # inputs below, and use the action's default version.
-      - name: Build a cloudpin tarball
-        working-directory: cloudpin-src
-        run: |
-          npm ci --ignore-scripts --no-audit --no-fund
-          npm run build
-          file="$(npm pack --silent | tail -n 1)"
-          test -f "$file"
-          # GITHUB_WORKSPACE is a native path on every runner, which npm accepts.
-          echo "CLOUDPIN_TGZ=$GITHUB_WORKSPACE/cloudpin-src/$file" >> "$GITHUB_ENV"
 
       # Secrets, not variables: the repository is public, and GitHub masks
       # secrets in logs and the job summary.
@@ -92,7 +72,6 @@ jobs:
         id: right
         uses: ./
         with:
-          package: ${{ env.CLOUDPIN_TGZ }}
           check: azure
           working-directory: ${{ runner.temp }}/azure/right
       - name: assert the right pin matched
@@ -109,7 +88,6 @@ jobs:
         continue-on-error: true
         uses: ./
         with:
-          package: ${{ env.CLOUDPIN_TGZ }}
           check: azure
           working-directory: ${{ runner.temp }}/azure/wrong
       - name: assert the control failed

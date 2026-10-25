@@ -7,9 +7,6 @@ runs [cloudpin](https://github.com/paureis/cloudpin) against the logins the job 
 checked cloud isn't installed, isn't logged in, or is logged in to an account other than the pinned one. A wrong
 secret, a copied workflow or a stale variable then fails at this step instead of deploying.
 
-> **Not released yet.** `v1` ships together with cloudpin 1.2.0, which adds the `check --only` and `--json` modes
-> this action uses.
-
 ## Usage
 
 ```yaml
