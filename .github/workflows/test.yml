@@ -36,27 +36,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Check out cloudpin main
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: paureis/cloudpin
-          ref: main
-          path: cloudpin-src
-          persist-credentials: false
-
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
-
-      - name: Build a cloudpin tarball
-        working-directory: cloudpin-src
-        run: |
-          npm ci --ignore-scripts --no-audit --no-fund
-          npm run build
-          file="$(npm pack --silent | tail -n 1)"
-          test -f "$file"
-          # GITHUB_WORKSPACE is a native path on every runner, which npm accepts.
-          echo "CLOUDPIN_TGZ=$GITHUB_WORKSPACE/cloudpin-src/$file" >> "$GITHUB_ENV"
 
       - name: Unit tests
         run: |
@@ -102,7 +84,6 @@ jobs:
         id: right-pin
         uses: ./
         with:
-          package: ${{ env.CLOUDPIN_TGZ }}
           check: kubernetes
           working-directory: ${{ runner.temp }}/cases/right-pin
       - name: "Assert: right pin passed with result match"
@@ -119,7 +100,6 @@ jobs:
         continue-on-error: true
         uses: ./
         with:
-          package: ${{ env.CLOUDPIN_TGZ }}
           check: kubernetes
           working-directory: ${{ runner.temp }}/cases/wrong-pin
       - name: "Assert: wrong pin failed with result mismatch"
@@ -135,7 +115,6 @@ jobs:
         id: no-pin-file
         uses: ./
         with:
-          package: ${{ env.CLOUDPIN_TGZ }}
           working-directory: ${{ runner.temp }}/cases/no-pin-file
       - name: "Assert: no .cloudpin.yml passed with result unpinned"
         env:
@@ -151,7 +130,6 @@ jobs:
         continue-on-error: true
         uses: ./
         with:
-          package: ${{ env.CLOUDPIN_TGZ }}
           check: aws
           working-directory: ${{ runner.temp }}/cases/not-pinned
       - name: "Assert: not-pinned failed with result error"
@@ -167,7 +145,6 @@ jobs:
         id: two-clouds
         uses: ./
         with:
-          package: ${{ env.CLOUDPIN_TGZ }}
           check: kubernetes
           working-directory: ${{ runner.temp }}/cases/two-clouds
       - name: "Assert: two clouds passed with result match"
@@ -183,7 +160,6 @@ jobs:
         id: every-pinned
         uses: ./
         with:
-          package: ${{ env.CLOUDPIN_TGZ }}
           working-directory: ${{ runner.temp }}/cases/every-pinned
       - name: "Assert: every pinned cloud passed with result match"
         env:
@@ -198,7 +174,6 @@ jobs:
         id: environment-input
         uses: ./
         with:
-          package: ${{ env.CLOUDPIN_TGZ }}
           check: kubernetes
           environment: right
           working-directory: ${{ runner.temp }}/cases/environment-input
@@ -215,7 +190,6 @@ jobs:
         id: head-branch
         uses: ./
         with:
-          package: ${{ env.CLOUDPIN_TGZ }}
           check: kubernetes
           working-directory: ${{ runner.temp }}/cases/head-branch
       - name: "Assert: branch mapping passed with result match"
